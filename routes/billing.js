@@ -1,91 +1,142 @@
 const express = require('express');
 const Stripe = require('stripe');
-const { randomUUID } = require('crypto');
+const jwt = require('jsonwebtoken');
+const { randomUUID, randomBytes } = require('crypto');
 const db = require('../db');
 const { requireAuth } = require('../auth');
+const { sendSubscriptionWelcomeEmail, sendCancellationEmail } = require('../email');
 
 const router = express.Router();
 
 if (!process.env.STRIPE_SECRET_KEY) {
-  console.warn('[stripe] STRIPE_SECRET_KEY absente : les routes /billing renverront une erreur tant qu\'elle ne sera pas definie dans .env');
+  console.warn('[stripe] STRIPE_SECRET_KEY absente : les routes /billing renverront une erreur.');
 }
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 function requireStripe(req, res, next) {
-  if (!stripe) return res.status(500).json({ error: 'Stripe n\'est pas configure sur ce serveur (STRIPE_SECRET_KEY manquante).' });
+  if (!stripe) return res.status(500).json({ error: 'Stripe n\'est pas configuré sur ce serveur (STRIPE_SECRET_KEY manquante).' });
   next();
 }
 
-// POST /billing/create-checkout-session  (auth requise)
-// Cree une session Stripe Checkout pour l'abonnement, et renvoie l'URL
-// vers laquelle rediriger l'utilisateur (redirection cote client classique,
-// pas d'integration Stripe.js necessaire pour ce flux).
+function generateCode() {
+  return 'SPEC-' + randomBytes(3).toString('hex').toUpperCase();
+}
+
+// Jeton signé permettant d'ouvrir le portail Stripe depuis un lien e-mail,
+// sans avoir à se connecter (l'abonné n'a pas forcément encore créé son compte).
+function signManageToken(customerId) {
+  return jwt.sign({ cus: customerId, kind: 'manage' }, process.env.JWT_SECRET, { expiresIn: '365d' });
+}
+
+// POST /billing/create-checkout-session (auth requise)
 router.post('/create-checkout-session', requireAuth, requireStripe, async (req, res) => {
   try {
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
+    const user = await db.get('SELECT * FROM users WHERE id = ?', [req.user.sub]);
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
 
-    let sub = db.prepare('SELECT * FROM subscriptions WHERE user_id = ?').get(user.id);
+    let sub = await db.get('SELECT * FROM subscriptions WHERE user_id = ?', [user.id]);
     let customerId = sub && sub.stripe_customer_id;
     if (!customerId) {
       const customer = await stripe.customers.create({ email: user.email, metadata: { userId: user.id } });
       customerId = customer.id;
-      const id = randomUUID();
-      db.prepare(`
+      await db.run(`
         INSERT INTO subscriptions (id, user_id, stripe_customer_id, status)
         VALUES (?, ?, ?, 'inactive')
-        ON CONFLICT(user_id) DO UPDATE SET stripe_customer_id = excluded.stripe_customer_id
-      `).run(id, user.id, customerId);
+        ON CONFLICT(user_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id
+      `, [randomUUID(), user.id, customerId]);
     }
 
     const priceId = req.body?.priceId || process.env.STRIPE_DEFAULT_PRICE_ID;
-    if (!priceId) return res.status(400).json({ error: 'priceId requis (ou STRIPE_DEFAULT_PRICE_ID dans .env).' });
+    if (!priceId) return res.status(400).json({ error: 'priceId requis (ou STRIPE_DEFAULT_PRICE_ID).' });
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer: customerId,
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: (process.env.APP_URL || 'http://localhost:3000') + '/billing/success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: (process.env.APP_URL || 'http://localhost:3000') + '/billing/cancel',
+      success_url: (process.env.APP_URL || 'http://localhost:3000') + '/app.html?checkout=success',
+      cancel_url: (process.env.APP_URL || 'http://localhost:3000') + '/index.html#offre',
       allow_promotion_codes: true,
     });
-
     res.json({ url: session.url });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Erreur lors de la creation de la session de paiement.' });
+    res.status(500).json({ error: 'Erreur lors de la création de la session de paiement.' });
   }
 });
 
-// POST /billing/create-portal-session (auth requise)
-// Portail Stripe standard : l'utilisateur y gere/annule son abonnement
-// et modifie son moyen de paiement, sans que vous ayez a construire cet ecran.
+// POST /billing/create-portal-session (auth requise, depuis l'app)
 router.post('/create-portal-session', requireAuth, requireStripe, async (req, res) => {
-  const sub = db.prepare('SELECT * FROM subscriptions WHERE user_id = ?').get(req.user.sub);
-  if (!sub || !sub.stripe_customer_id) return res.status(404).json({ error: 'Aucun abonnement Stripe pour ce compte.' });
+  const sub = await db.get('SELECT * FROM subscriptions WHERE user_id = ?', [req.user.sub]);
+  let customerId = sub && sub.stripe_customer_id;
+  if (!customerId) {
+    // L'abonné a pu payer via le lien Stripe AVANT de créer son compte :
+    // on retrouve alors son client Stripe par son e-mail.
+    const paid = await db.get('SELECT stripe_customer_id FROM paid_emails WHERE email = ?', [req.user.email.toLowerCase()]);
+    customerId = paid && paid.stripe_customer_id;
+  }
+  if (!customerId) return res.status(404).json({ error: 'Aucun abonnement Stripe pour ce compte.' });
   try {
     const portal = await stripe.billingPortal.sessions.create({
-      customer: sub.stripe_customer_id,
-      return_url: (process.env.APP_URL || 'http://localhost:3000') + '/account',
+      customer: customerId,
+      return_url: (process.env.APP_URL || 'http://localhost:3000') + '/app.html',
     });
     res.json({ url: portal.url });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Erreur lors de la creation du portail client.' });
+    res.status(500).json({ error: 'Erreur lors de la création du portail client.' });
   }
 });
 
-// GET /billing/status (auth requise) -- pour que le frontend sache si le compte est actif
-router.get('/status', requireAuth, (req, res) => {
-  const sub = db.prepare('SELECT status, price_id, current_period_end FROM subscriptions WHERE user_id = ?').get(req.user.sub);
-  res.json({ status: sub ? sub.status : 'inactive', priceId: sub?.price_id, currentPeriodEnd: sub?.current_period_end });
+// GET /billing/manage?token=...  -- lien de RESILIATION envoyé par e-mail.
+// Redirige directement vers le portail Stripe, sans connexion préalable.
+router.get('/manage', requireStripe, async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(400).send('Lien invalide : jeton manquant.');
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (e) {
+    return res.status(401).send('Ce lien de gestion a expiré ou n\'est pas valide. Contactez-nous pour obtenir un nouveau lien.');
+  }
+  if (payload.kind !== 'manage' || !payload.cus) return res.status(400).send('Lien invalide.');
+  try {
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: payload.cus,
+      return_url: (process.env.APP_URL || 'http://localhost:3000') + '/index.html',
+    });
+    res.redirect(303, portal.url);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('Impossible d\'ouvrir le portail de gestion pour le moment.');
+  }
 });
 
-// POST /billing/webhook -- appele par Stripe, PAS par le frontend.
-// IMPORTANT : cette route doit recevoir le corps BRUT (pas du JSON parse),
-// c'est pourquoi server.js la monte AVANT express.json() -- voir server.js.
+// GET /billing/status (auth requise) -- consulté par l'app pour vérifier l'accès.
+router.get('/status', requireAuth, async (req, res) => {
+  const sub = await db.get('SELECT status, price_id, current_period_end FROM subscriptions WHERE user_id = ?', [req.user.sub]);
+  let status = sub ? sub.status : null;
+  let periodEnd = sub ? sub.current_period_end : null;
+
+  if (!status || status === 'inactive') {
+    const paid = await db.get('SELECT status, current_period_end FROM paid_emails WHERE email = ?', [req.user.email.toLowerCase()]);
+    if (paid) { status = paid.status; periodEnd = paid.current_period_end; }
+  }
+  // Un compte créé via code d'invitation n'a pas d'abonnement propre : il
+  // dépend de celui qui l'a invité. On le considère actif tant qu'un lien existe.
+  if (!status || status === 'inactive') {
+    const link = await db.get(
+      'SELECT 1 FROM links WHERE person_id = ? OR caregiver_id = ? LIMIT 1',
+      [req.user.sub, req.user.sub]
+    );
+    if (link) status = 'linked';
+  }
+  const active = ['active', 'trialing', 'past_due', 'linked'].includes(status);
+  res.json({ status: status || 'inactive', active, currentPeriodEnd: periodEnd });
+});
+
+// POST /billing/webhook -- appelé par Stripe uniquement.
 async function webhookHandler(req, res) {
-  if (!stripe) return res.status(500).send('Stripe non configure.');
+  if (!stripe) return res.status(500).send('Stripe non configuré.');
   const sig = req.headers['stripe-signature'];
   let event;
   try {
@@ -95,37 +146,58 @@ async function webhookHandler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Met a jour la ligne "subscriptions" d'un compte Spectra DEJA existant,
-  // si un tel compte a deja ete cree et lie a ce client Stripe (portail/statut).
-  const upsertExistingAccount = (customerId, fields) => {
-    const sub = db.prepare('SELECT * FROM subscriptions WHERE stripe_customer_id = ?').get(customerId);
+  const upsertExistingAccount = async (customerId, fields) => {
+    const sub = await db.get('SELECT * FROM subscriptions WHERE stripe_customer_id = ?', [customerId]);
     if (!sub) return;
-    db.prepare(`
+    await db.run(`
       UPDATE subscriptions SET
         status = COALESCE(?, status),
         stripe_subscription_id = COALESCE(?, stripe_subscription_id),
         price_id = COALESCE(?, price_id),
         current_period_end = COALESCE(?, current_period_end),
-        updated_at = datetime('now')
+        updated_at = now()
       WHERE stripe_customer_id = ?
-    `).run(fields.status || null, fields.subscriptionId || null, fields.priceId || null, fields.currentPeriodEnd || null, customerId);
+    `, [fields.status || null, fields.subscriptionId || null, fields.priceId || null, fields.currentPeriodEnd || null, customerId]);
   };
 
-  // Met a jour paid_emails, INDEPENDAMMENT de l'existence d'un compte Spectra.
-  // C'est la source de verite consultee par /auth/register.
-  const upsertPaidEmail = (email, customerId, fields) => {
+  const upsertPaidEmail = async (email, customerId, fields) => {
     if (!email) return;
     email = email.toLowerCase();
-    db.prepare(`
+    await db.run(`
       INSERT INTO paid_emails (email, stripe_customer_id, stripe_subscription_id, status, current_period_end)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(email) DO UPDATE SET
-        stripe_customer_id = excluded.stripe_customer_id,
-        stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, paid_emails.stripe_subscription_id),
-        status = excluded.status,
-        current_period_end = COALESCE(excluded.current_period_end, paid_emails.current_period_end),
-        updated_at = datetime('now')
-    `).run(email, customerId, fields.subscriptionId || null, fields.status || 'active', fields.currentPeriodEnd || null);
+        stripe_customer_id = EXCLUDED.stripe_customer_id,
+        stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, paid_emails.stripe_subscription_id),
+        status = EXCLUDED.status,
+        current_period_end = COALESCE(EXCLUDED.current_period_end, paid_emails.current_period_end),
+        updated_at = now()
+    `, [email, customerId, fields.subscriptionId || null, fields.status || 'active', fields.currentPeriodEnd || null]);
+  };
+
+  // Envoie l'e-mail de bienvenue (compte + code d'invitation + lien de
+  // résiliation) une seule fois par abonné, grâce à welcome_sent_at.
+  const sendWelcomeOnce = async (email, customerId) => {
+    if (!email) return;
+    email = email.toLowerCase();
+    const row = await db.get('SELECT welcome_sent_at FROM paid_emails WHERE email = ?', [email]);
+    if (row && row.welcome_sent_at) return;
+
+    const code = generateCode();
+    const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+    await db.run(
+      'INSERT INTO invite_codes (code, source_email, role_label, expires_at) VALUES (?, ?, ?, ?)',
+      [code, email, '', expiresAt]
+    );
+    const result = await sendSubscriptionWelcomeEmail({
+      to: email,
+      inviteCode: code,
+      inviteExpiresAt: expiresAt,
+      manageToken: signManageToken(customerId),
+    });
+    if (result.sent) {
+      await db.run('UPDATE paid_emails SET welcome_sent_at = now() WHERE email = ?', [email]);
+    }
   };
 
   async function getCustomerEmail(customerId) {
@@ -133,7 +205,7 @@ async function webhookHandler(req, res) {
       const customer = await stripe.customers.retrieve(customerId);
       return customer && !customer.deleted ? customer.email : null;
     } catch (e) {
-      console.error('Impossible de recuperer l\'email du client Stripe:', e.message);
+      console.error('Impossible de récupérer l\'email du client Stripe:', e.message);
       return null;
     }
   }
@@ -143,8 +215,9 @@ async function webhookHandler(req, res) {
       case 'checkout.session.completed': {
         const session = event.data.object;
         const email = session.customer_details?.email || await getCustomerEmail(session.customer);
-        upsertPaidEmail(email, session.customer, { status: 'active', subscriptionId: session.subscription });
-        upsertExistingAccount(session.customer, { status: 'active', subscriptionId: session.subscription });
+        await upsertPaidEmail(email, session.customer, { status: 'active', subscriptionId: session.subscription });
+        await upsertExistingAccount(session.customer, { status: 'active', subscriptionId: session.subscription });
+        await sendWelcomeOnce(email, session.customer);
         break;
       }
       case 'customer.subscription.updated':
@@ -152,39 +225,39 @@ async function webhookHandler(req, res) {
         const s = event.data.object;
         const email = await getCustomerEmail(s.customer);
         const fields = {
-          status: s.status, // active | past_due | canceled | trialing ...
+          status: s.status,
           subscriptionId: s.id,
           priceId: s.items?.data?.[0]?.price?.id,
           currentPeriodEnd: s.current_period_end ? new Date(s.current_period_end * 1000).toISOString() : null,
         };
-        upsertPaidEmail(email, s.customer, fields);
-        upsertExistingAccount(s.customer, fields);
+        await upsertPaidEmail(email, s.customer, fields);
+        await upsertExistingAccount(s.customer, fields);
+        if (['active', 'trialing'].includes(s.status)) await sendWelcomeOnce(email, s.customer);
         break;
       }
       case 'customer.subscription.deleted': {
         const s = event.data.object;
         const email = await getCustomerEmail(s.customer);
-        upsertPaidEmail(email, s.customer, { status: 'canceled' });
-        upsertExistingAccount(s.customer, { status: 'canceled' });
+        const periodEnd = s.current_period_end ? new Date(s.current_period_end * 1000).toISOString() : null;
+        await upsertPaidEmail(email, s.customer, { status: 'canceled', currentPeriodEnd: periodEnd });
+        await upsertExistingAccount(s.customer, { status: 'canceled' });
+        if (email) await sendCancellationEmail({ to: email, periodEnd });
         break;
       }
       default:
-        // Autres evenements ignores volontairement pour ce point de depart.
         break;
     }
   } catch (e) {
     console.error('Erreur de traitement du webhook:', e);
-    // On repond quand meme 200 pour eviter que Stripe ne re-essaie indefiniment
-    // un evenement qui echoue systematiquement ; l'erreur reste dans les logs.
   }
 
   res.json({ received: true });
 }
 
-// Utilisee par /auth/register pour verifier qu'un paiement reel existe pour cet email.
-function isEmailPaid(email) {
+// Utilisée par /auth/register pour vérifier qu'un paiement réel existe.
+async function isEmailPaid(email) {
   if (!email) return false;
-  const row = db.prepare('SELECT status FROM paid_emails WHERE email = ?').get(email.toLowerCase());
+  const row = await db.get('SELECT status FROM paid_emails WHERE email = ?', [email.toLowerCase()]);
   return !!row && (row.status === 'active' || row.status === 'trialing');
 }
 

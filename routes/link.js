@@ -12,77 +12,84 @@ function generateCode() {
 }
 
 // POST /link/invite  { roleLabel, email }
-// N'importe quel compte (personne OU aidant) peut generer une invitation :
-// c'est le role INVERSE qui pourra l'utiliser. Si "email" est fourni, un vrai
-// e-mail est envoye (voir email.js) ; sinon le code est juste renvoye pour
-// que vous le partagiez vous-meme (SMS, en personne...).
 router.post('/invite', async (req, res) => {
-  const code = generateCode();
-  const expiresAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
-  const email = (req.body?.email || '').trim().toLowerCase() || null;
+  try {
+    const code = generateCode();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+    const email = (req.body?.email || '').trim().toLowerCase() || null;
 
-  db.prepare(
-    'INSERT INTO invite_codes (code, inviter_id, inviter_role, invitee_email, role_label, expires_at) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(code, req.user.sub, req.user.role, email, req.body?.roleLabel || '', expiresAt);
+    await db.run(
+      'INSERT INTO invite_codes (code, inviter_id, inviter_role, invitee_email, role_label, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [code, req.user.sub, req.user.role, email, req.body?.roleLabel || '', expiresAt]
+    );
 
-  let emailResult = null;
-  if (email) {
-    const inviter = db.prepare('SELECT email FROM users WHERE id = ?').get(req.user.sub);
-    emailResult = await sendInviteEmail({ to: email, code, expiresAt, inviterEmail: inviter?.email });
+    let emailResult = null;
+    if (email) {
+      const inviter = await db.get('SELECT email FROM users WHERE id = ?', [req.user.sub]);
+      emailResult = await sendInviteEmail({ to: email, code, expiresAt, inviterEmail: inviter?.email });
+    }
+    res.status(201).json({ code, expiresAt, email: emailResult });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur lors de la création de l\'invitation.' });
   }
-
-  res.status(201).json({ code, expiresAt, email: emailResult });
 });
 
 // POST /link/redeem  { code }
-// Le compte qui utilise le code doit avoir le role OPPOSE de celui qui l'a cree.
-router.post('/redeem', (req, res) => {
-  const { code } = req.body || {};
-  if (!code) return res.status(400).json({ error: 'code requis.' });
+router.post('/redeem', async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ error: 'code requis.' });
 
-  const invite = db.prepare('SELECT * FROM invite_codes WHERE code = ?').get(code.toUpperCase());
-  if (!invite) return res.status(404).json({ error: 'Code invalide.' });
-  if (invite.used_at) return res.status(410).json({ error: 'Ce code a deja ete utilise.' });
-  if (new Date(invite.expires_at) < new Date()) return res.status(410).json({ error: 'Ce code a expire.' });
-  if (invite.inviter_id === req.user.sub) return res.status(400).json({ error: 'Vous ne pouvez pas utiliser votre propre invitation.' });
-  if (invite.inviter_role === req.user.role) {
-    return res.status(403).json({ error: 'Ce code a ete cree par un compte du meme type que le vôtre (deux personnes, ou deux aidants) : il faut un compte "personne" et un compte "aidant" pour se lier.' });
+    const invite = await db.get('SELECT * FROM invite_codes WHERE code = ?', [code.toUpperCase()]);
+    if (!invite) return res.status(404).json({ error: 'Code invalide.' });
+    if (invite.used_at) return res.status(410).json({ error: 'Ce code a déjà été utilisé.' });
+    if (new Date(invite.expires_at) < new Date()) return res.status(410).json({ error: 'Ce code a expiré.' });
+    if (!invite.inviter_id) {
+      return res.status(400).json({ error: 'Ce code sert à créer un nouveau compte, pas à lier un compte existant.' });
+    }
+    if (invite.inviter_id === req.user.sub) return res.status(400).json({ error: 'Vous ne pouvez pas utiliser votre propre invitation.' });
+    if (invite.inviter_role === req.user.role) {
+      return res.status(403).json({ error: 'Ce code a été créé par un compte du même type que le vôtre : il faut un compte "personne" et un compte "aidant" pour se lier.' });
+    }
+
+    const personId = invite.inviter_role === 'person' ? invite.inviter_id : req.user.sub;
+    const caregiverId = invite.inviter_role === 'caregiver' ? invite.inviter_id : req.user.sub;
+
+    await db.transaction(async (t) => {
+      await t.run(
+        'INSERT INTO links (id, person_id, caregiver_id, role_label) VALUES (?, ?, ?, ?) ON CONFLICT (person_id, caregiver_id) DO NOTHING',
+        [randomUUID(), personId, caregiverId, invite.role_label]
+      );
+      await t.run('UPDATE invite_codes SET used_at = now() WHERE code = ?', [invite.code]);
+    });
+
+    res.json({ linked: true, personId, caregiverId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur lors de la liaison des comptes.' });
   }
-
-  const personId = invite.inviter_role === 'person' ? invite.inviter_id : req.user.sub;
-  const caregiverId = invite.inviter_role === 'caregiver' ? invite.inviter_id : req.user.sub;
-
-  const linkId = randomUUID();
-  const tx = db.transaction(() => {
-    db.prepare(
-      'INSERT OR IGNORE INTO links (id, person_id, caregiver_id, role_label) VALUES (?, ?, ?, ?)'
-    ).run(linkId, personId, caregiverId, invite.role_label);
-    db.prepare('UPDATE invite_codes SET used_at = datetime(\'now\') WHERE code = ?').run(invite.code);
-  });
-  tx();
-
-  res.json({ linked: true, personId, caregiverId });
 });
 
-// GET /link/mine  -- liste les liens de l'utilisateur connecte, dans un sens ou dans l'autre
-router.get('/mine', (req, res) => {
+// GET /link/mine
+router.get('/mine', async (req, res) => {
   const rows = req.user.role === 'person'
-    ? db.prepare(`SELECT l.id, l.role_label, l.created_at, u.id as caregiver_id, u.display_name, u.email
-                  FROM links l JOIN users u ON u.id = l.caregiver_id WHERE l.person_id = ?`).all(req.user.sub)
-    : db.prepare(`SELECT l.id, l.role_label, l.created_at, u.id as person_id, u.display_name, u.email
-                  FROM links l JOIN users u ON u.id = l.person_id WHERE l.caregiver_id = ?`).all(req.user.sub);
+    ? await db.query(`SELECT l.id, l.role_label, l.created_at, u.id as caregiver_id, u.display_name, u.email
+                      FROM links l JOIN users u ON u.id = l.caregiver_id WHERE l.person_id = ?`, [req.user.sub])
+    : await db.query(`SELECT l.id, l.role_label, l.created_at, u.id as person_id, u.display_name, u.email
+                      FROM links l JOIN users u ON u.id = l.person_id WHERE l.caregiver_id = ?`, [req.user.sub]);
   res.json({ links: rows });
 });
 
-// DELETE /link/:id  -- rompre un lien (accessible aux deux parties du lien)
-router.delete('/:id', (req, res) => {
-  const link = db.prepare('SELECT * FROM links WHERE id = ?').get(req.params.id);
+// DELETE /link/:id
+router.delete('/:id', async (req, res) => {
+  const link = await db.get('SELECT * FROM links WHERE id = ?', [req.params.id]);
   if (!link) return res.status(404).json({ error: 'Lien introuvable.' });
   if (link.person_id !== req.user.sub && link.caregiver_id !== req.user.sub) {
-    return res.status(403).json({ error: 'Ce lien ne vous appartient pas.' });
+    return res.status(403).json({ error: 'Ce lien ne vous concerne pas.' });
   }
-  db.prepare('DELETE FROM links WHERE id = ?').run(req.params.id);
-  res.json({ deleted: true });
+  await db.run('DELETE FROM links WHERE id = ?', [req.params.id]);
+  res.json({ ok: true });
 });
 
 module.exports = router;
