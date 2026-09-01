@@ -36,8 +36,10 @@ router.post('/register', async (req, res) => {
       const invite = await db.get('SELECT * FROM invite_codes WHERE code = ?', [inviteCode.toUpperCase()]);
       if (invite && !invite.used_at && new Date(invite.expires_at) >= new Date()) {
         if (invite.inviter_id) {
-          const inviter = await db.get('SELECT id FROM users WHERE id = ?', [invite.inviter_id]);
-          if (inviter) { authorized = true; usedInvite = invite; }
+          // L'inviteur doit exister ET son abonnement doit toujours etre actif :
+          // un code cree puis resilie ne doit plus ouvrir de compte.
+          const inviter = await db.get('SELECT id, email FROM users WHERE id = ?', [invite.inviter_id]);
+          if (inviter && await isEmailPaid(inviter.email)) { authorized = true; usedInvite = invite; }
         } else {
           // Code émis automatiquement après un paiement Stripe : on vérifie
           // que l'abonnement de l'acheteur est toujours actif.

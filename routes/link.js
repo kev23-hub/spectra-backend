@@ -11,9 +11,51 @@ function generateCode() {
   return 'SPEC-' + randomBytes(3).toString('hex').toUpperCase();
 }
 
+// Nombre maximum de comptes rattaches a UN abonnement (le payeur inclus).
+// Exemple avec 4 : le parent qui paie + la personne accompagnee + 2 autres
+// aidants (second parent, enseignant...). Ajustez INVITE_MAX_ACCOUNTS dans
+// les variables d'environnement Render si vous voulez etre plus ou moins large.
+const INVITE_MAX_ACCOUNTS = parseInt(process.env.INVITE_MAX_ACCOUNTS || '4', 10);
+
 // POST /link/invite  { roleLabel, email }
+//
+// SECURITE : sans ces controles, un seul abonnement payant pouvait alimenter
+// un nombre illimite de comptes gratuits, et chaque compte invite pouvait a
+// son tour inviter d'autres personnes (chaine infinie).
 router.post('/invite', async (req, res) => {
   try {
+    const { isEmailPaid } = require('./billing');
+    const me = await db.get('SELECT email FROM users WHERE id = ?', [req.user.sub]);
+    if (!me) return res.status(404).json({ error: 'Compte introuvable.' });
+
+    // 1) Seul le compte qui paie reellement peut inviter.
+    if (!(await isEmailPaid(me.email))) {
+      return res.status(403).json({
+        error: "Seul le compte ayant souscrit l'abonnement peut inviter d'autres personnes.",
+        reason: 'NOT_SUBSCRIBER',
+      });
+    }
+
+    // 2) Plafond : comptes deja crees via mes codes + codes encore utilisables.
+    const used = await db.get(`
+      SELECT count(*)::int AS n FROM users u
+      JOIN invite_codes c ON c.code = u.invited_via
+      WHERE c.inviter_id = ? OR lower(c.source_email) = lower(?)
+    `, [req.user.sub, me.email]);
+    const pending = await db.get(`
+      SELECT count(*)::int AS n FROM invite_codes
+      WHERE used_at IS NULL AND expires_at > now()
+        AND (inviter_id = ? OR lower(source_email) = lower(?))
+    `, [req.user.sub, me.email]);
+
+    const total = 1 + (used?.n || 0) + (pending?.n || 0); // 1 = le payeur lui-meme
+    if (total >= INVITE_MAX_ACCOUNTS) {
+      return res.status(409).json({
+        error: `Votre abonnement permet ${INVITE_MAX_ACCOUNTS} comptes au maximum (le vôtre inclus). Supprimez un lien existant avant d'inviter quelqu'un d'autre.`,
+        reason: 'INVITE_LIMIT_REACHED',
+      });
+    }
+
     const code = generateCode();
     const expiresAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
     const email = (req.body?.email || '').trim().toLowerCase() || null;
