@@ -84,3 +84,9 @@ CREATE INDEX IF NOT EXISTS idx_kv_owner ON kv_store(owner_id);
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_customer ON subscriptions(stripe_customer_id);
+
+-- Mémorise le code d'invitation ayant permis de créer le compte. Sans cela,
+-- une personne invitée (qui ne paie pas elle-même et n'a pas toujours de lien
+-- immédiat) était considérée comme non abonnée et perdait l'accès au
+-- rechargement suivant.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS invited_via TEXT;

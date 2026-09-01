@@ -121,8 +121,26 @@ router.get('/status', requireAuth, async (req, res) => {
     const paid = await db.get('SELECT status, current_period_end FROM paid_emails WHERE email = ?', [req.user.email.toLowerCase()]);
     if (paid) { status = paid.status; periodEnd = paid.current_period_end; }
   }
-  // Un compte créé via code d'invitation n'a pas d'abonnement propre : il
-  // dépend de celui qui l'a invité. On le considère actif tant qu'un lien existe.
+  // Un compte créé via code d'invitation n'a pas d'abonnement propre : son
+  // accès dépend de celui qui l'a invité. On remonte donc jusqu'au payeur.
+  if (!status || status === 'inactive') {
+    const me = await db.get('SELECT invited_via FROM users WHERE id = ?', [req.user.sub]);
+    if (me && me.invited_via) {
+      const invite = await db.get('SELECT inviter_id, source_email FROM invite_codes WHERE code = ?', [me.invited_via]);
+      if (invite) {
+        let sponsorEmail = invite.source_email;
+        if (!sponsorEmail && invite.inviter_id) {
+          const inviter = await db.get('SELECT email FROM users WHERE id = ?', [invite.inviter_id]);
+          sponsorEmail = inviter && inviter.email;
+        }
+        if (sponsorEmail) {
+          const sponsor = await db.get('SELECT status FROM paid_emails WHERE email = ?', [sponsorEmail.toLowerCase()]);
+          if (sponsor && ['active', 'trialing', 'past_due'].includes(sponsor.status)) status = 'linked';
+        }
+      }
+    }
+  }
+  // Filet de sécurité : un lien actif avec un autre compte vaut aussi accès.
   if (!status || status === 'inactive') {
     const link = await db.get(
       'SELECT 1 FROM links WHERE person_id = ? OR caregiver_id = ? LIMIT 1',

@@ -57,8 +57,8 @@ router.post('/register', async (req, res) => {
     const id = randomUUID();
     const passwordHash = await bcrypt.hash(password, 10);
     await db.run(
-      'INSERT INTO users (id, email, password_hash, display_name, role) VALUES (?, ?, ?, ?, ?)',
-      [id, normalizedEmail, passwordHash, displayName || '', role]
+      'INSERT INTO users (id, email, password_hash, display_name, role, invited_via) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, normalizedEmail, passwordHash, displayName || '', role, usedInvite ? usedInvite.code : null]
     );
 
     if (usedInvite) {
