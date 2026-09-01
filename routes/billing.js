@@ -242,6 +242,12 @@ async function webhookHandler(req, res) {
       case 'customer.subscription.created': {
         const s = event.data.object;
         const email = await getCustomerEmail(s.customer);
+        // Un client qui resilie garde l'acces jusqu'a la fin de la periode
+        // deja payee : on conserve donc le statut renvoye par Stripe (souvent
+        // encore 'active' avec cancel_at_period_end). C'est l'evenement
+        // customer.subscription.deleted, envoye par Stripe a l'echeance, qui
+        // coupera l'acces le moment venu.
+        const resilie = s.cancel_at_period_end === true || !!s.canceled_at;
         const fields = {
           status: s.status,
           subscriptionId: s.id,
@@ -250,7 +256,7 @@ async function webhookHandler(req, res) {
         };
         await upsertPaidEmail(email, s.customer, fields);
         await upsertExistingAccount(s.customer, fields);
-        if (['active', 'trialing'].includes(s.status)) await sendWelcomeOnce(email, s.customer);
+        if (!resilie && ['active', 'trialing'].includes(s.status)) await sendWelcomeOnce(email, s.customer);
         break;
       }
       case 'customer.subscription.deleted': {
