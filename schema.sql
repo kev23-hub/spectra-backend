@@ -90,3 +90,25 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_customer ON subscriptions(st
 -- immédiat) était considérée comme non abonnée et perdait l'accès au
 -- rechargement suivant.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS invited_via TEXT;
+
+-- ---------------------------------------------------------------------------
+-- Migrations (idempotentes : rejouees a chaque demarrage sans effet de bord).
+-- ---------------------------------------------------------------------------
+
+-- Sans ceci, supprimer un compte echoue des qu'un aidant a ecrit dans les
+-- donnees partagees d'une personne : kv_store.updated_by referencait users(id)
+-- sans ON DELETE. Or la suppression de compte est exigee par le RGPD et par
+-- Google Play.
+ALTER TABLE kv_store ALTER COLUMN updated_by DROP NOT NULL;
+ALTER TABLE kv_store DROP CONSTRAINT IF EXISTS kv_store_updated_by_fkey;
+ALTER TABLE kv_store ADD CONSTRAINT kv_store_updated_by_fkey
+  FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL;
+
+-- Recherche des codes d'invitation emis automatiquement apres paiement.
+CREATE INDEX IF NOT EXISTS idx_invite_source_email ON invite_codes(lower(source_email));
+CREATE INDEX IF NOT EXISTS idx_invite_inviter ON invite_codes(inviter_id);
+
+-- Date du dernier controle de l'abonnement directement aupres de Stripe.
+-- Permet de se passer du webhook : si la colonne est vide ou trop ancienne,
+-- le serveur redemande a Stripe l'etat reel de l'abonnement.
+ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;

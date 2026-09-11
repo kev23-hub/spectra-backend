@@ -1,0 +1,13 @@
+# Dependances installees par npm : jamais dans Git, elles se reinstallent
+# toutes seules avec package.json.
+node_modules/
+
+# Secrets : cles Stripe, mot de passe de la base, jetons. JAMAIS dans Git.
+.env
+.env.local
+.env.test
+.env.*.local
+
+# Divers
+*.log
+.DS_Store

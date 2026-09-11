@@ -1,9 +1,8 @@
 const express = require('express');
 const Stripe = require('stripe');
-const jwt = require('jsonwebtoken');
 const { randomUUID, randomBytes } = require('crypto');
 const db = require('../db');
-const { requireAuth } = require('../auth');
+const { requireAuth, signManageToken, verifyManageToken } = require('../auth');
 const { sendSubscriptionWelcomeEmail, sendCancellationEmail } = require('../email');
 
 const router = express.Router();
@@ -13,8 +12,15 @@ if (!process.env.STRIPE_SECRET_KEY) {
 }
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
+// Statuts consideres comme "acces ouvert". past_due = paiement en echec mais
+// Stripe reessaie encore : on laisse l'acces (periode de grace), et on applique
+// EXACTEMENT la meme liste partout. Avant, /billing/status acceptait past_due
+// mais isEmailPaid non : le client gardait l'application mais ne pouvait plus
+// inviter personne ni creer de compte, sans explication.
+const ACTIVE_STATUSES = ['active', 'trialing', 'past_due'];
+
 function requireStripe(req, res, next) {
-  if (!stripe) return res.status(500).json({ error: 'Stripe n\'est pas configuré sur ce serveur (STRIPE_SECRET_KEY manquante).' });
+  if (!stripe) return res.status(500).json({ error: 'Stripe n\'est pas configure sur ce serveur (STRIPE_SECRET_KEY manquante).' });
   next();
 }
 
@@ -22,10 +28,14 @@ function generateCode() {
   return 'SPEC-' + randomBytes(3).toString('hex').toUpperCase();
 }
 
-// Jeton signé permettant d'ouvrir le portail Stripe depuis un lien e-mail,
-// sans avoir à se connecter (l'abonné n'a pas forcément encore créé son compte).
-function signManageToken(customerId) {
-  return jwt.sign({ cus: customerId, kind: 'manage' }, process.env.JWT_SECRET, { expiresIn: '365d' });
+// Les versions recentes de l'API Stripe ont deplace current_period_end de
+// l'abonnement vers ses items. On lit les deux emplacements, sinon les dates
+// de fin de periode deviennent silencieusement nulles apres une mise a jour
+// de version d'API cote Stripe.
+function periodEndOf(subscription) {
+  const ts = subscription.current_period_end
+    ?? subscription.items?.data?.[0]?.current_period_end;
+  return ts ? new Date(ts * 1000).toISOString() : null;
 }
 
 // POST /billing/create-checkout-session (auth requise)
@@ -60,7 +70,7 @@ router.post('/create-checkout-session', requireAuth, requireStripe, async (req, 
     res.json({ url: session.url });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Erreur lors de la création de la session de paiement.' });
+    res.status(500).json({ error: 'Erreur lors de la creation de la session de paiement.' });
   }
 });
 
@@ -69,8 +79,6 @@ router.post('/create-portal-session', requireAuth, requireStripe, async (req, re
   const sub = await db.get('SELECT * FROM subscriptions WHERE user_id = ?', [req.user.sub]);
   let customerId = sub && sub.stripe_customer_id;
   if (!customerId) {
-    // L'abonné a pu payer via le lien Stripe AVANT de créer son compte :
-    // on retrouve alors son client Stripe par son e-mail.
     const paid = await db.get('SELECT stripe_customer_id FROM paid_emails WHERE email = ?', [req.user.email.toLowerCase()]);
     customerId = paid && paid.stripe_customer_id;
   }
@@ -83,22 +91,20 @@ router.post('/create-portal-session', requireAuth, requireStripe, async (req, re
     res.json({ url: portal.url });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Erreur lors de la création du portail client.' });
+    res.status(500).json({ error: 'Erreur lors de la creation du portail client.' });
   }
 });
 
-// GET /billing/manage?token=...  -- lien de RESILIATION envoyé par e-mail.
-// Redirige directement vers le portail Stripe, sans connexion préalable.
+// GET /billing/manage?token=...  -- lien de RESILIATION envoye par e-mail.
 router.get('/manage', requireStripe, async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(400).send('Lien invalide : jeton manquant.');
   let payload;
   try {
-    payload = jwt.verify(token, process.env.JWT_SECRET);
+    payload = verifyManageToken(token);
   } catch (e) {
-    return res.status(401).send('Ce lien de gestion a expiré ou n\'est pas valide. Contactez-nous pour obtenir un nouveau lien.');
+    return res.status(401).send('Ce lien de gestion a expire ou n\'est pas valide.');
   }
-  if (payload.kind !== 'manage' || !payload.cus) return res.status(400).send('Lien invalide.');
   try {
     const portal = await stripe.billingPortal.sessions.create({
       customer: payload.cus,
@@ -111,19 +117,24 @@ router.get('/manage', requireStripe, async (req, res) => {
   }
 });
 
-// GET /billing/status (auth requise) -- consulté par l'app pour vérifier l'accès.
+// GET /billing/status (auth requise) -- consulte par l'app pour verifier l'acces.
 router.get('/status', requireAuth, async (req, res) => {
   const sub = await db.get('SELECT status, price_id, current_period_end FROM subscriptions WHERE user_id = ?', [req.user.sub]);
   let status = sub ? sub.status : null;
   let periodEnd = sub ? sub.current_period_end : null;
 
-  if (!status || status === 'inactive') {
+  const inactive = () => !status || status === 'inactive' || !ACTIVE_STATUSES.includes(status);
+
+  if (inactive()) {
+    // isEmailPaid interroge Stripe directement si l'e-mail est inconnu ou si le
+    // dernier controle date de plus de 12 h : l'acces ne depend donc plus du webhook.
+    await isEmailPaid(req.user.email);
     const paid = await db.get('SELECT status, current_period_end FROM paid_emails WHERE email = ?', [req.user.email.toLowerCase()]);
-    if (paid) { status = paid.status; periodEnd = paid.current_period_end; }
+    if (paid && ACTIVE_STATUSES.includes(paid.status)) { status = paid.status; periodEnd = paid.current_period_end; }
   }
-  // Un compte créé via code d'invitation n'a pas d'abonnement propre : son
-  // accès dépend de celui qui l'a invité. On remonte donc jusqu'au payeur.
-  if (!status || status === 'inactive') {
+
+  // Compte cree via code d'invitation : l'acces depend du payeur qui l'a invite.
+  if (inactive()) {
     const me = await db.get('SELECT invited_via FROM users WHERE id = ?', [req.user.sub]);
     if (me && me.invited_via) {
       const invite = await db.get('SELECT inviter_id, source_email FROM invite_codes WHERE code = ?', [me.invited_via]);
@@ -135,26 +146,35 @@ router.get('/status', requireAuth, async (req, res) => {
         }
         if (sponsorEmail) {
           const sponsor = await db.get('SELECT status FROM paid_emails WHERE email = ?', [sponsorEmail.toLowerCase()]);
-          if (sponsor && ['active', 'trialing', 'past_due'].includes(sponsor.status)) status = 'linked';
+          if (sponsor && ACTIVE_STATUSES.includes(sponsor.status)) status = 'linked';
         }
       }
     }
   }
-  // Filet de sécurité : un lien actif avec un autre compte vaut aussi accès.
-  if (!status || status === 'inactive') {
-    const link = await db.get(
-      'SELECT 1 FROM links WHERE person_id = ? OR caregiver_id = ? LIMIT 1',
-      [req.user.sub, req.user.sub]
-    );
-    if (link) status = 'linked';
+
+  // Filet de securite : un lien avec un compte QUI PAIE ENCORE vaut acces.
+  // L'ancienne version accordait l'acces des qu'un lien existait, sans jamais
+  // verifier le paiement : les comptes invites gardaient donc l'acces a vie
+  // apres la resiliation du payeur.
+  if (inactive()) {
+    const others = await db.query(`
+      SELECT u.email FROM links l
+      JOIN users u ON u.id = CASE WHEN l.person_id = ? THEN l.caregiver_id ELSE l.person_id END
+      WHERE l.person_id = ? OR l.caregiver_id = ?
+    `, [req.user.sub, req.user.sub, req.user.sub]);
+    for (const other of others) {
+      const sponsor = await db.get('SELECT status FROM paid_emails WHERE email = ?', [other.email.toLowerCase()]);
+      if (sponsor && ACTIVE_STATUSES.includes(sponsor.status)) { status = 'linked'; break; }
+    }
   }
-  const active = ['active', 'trialing', 'past_due', 'linked'].includes(status);
+
+  const active = ACTIVE_STATUSES.includes(status) || status === 'linked';
   res.json({ status: status || 'inactive', active, currentPeriodEnd: periodEnd });
 });
 
-// POST /billing/webhook -- appelé par Stripe uniquement.
+// POST /billing/webhook -- appele par Stripe uniquement.
 async function webhookHandler(req, res) {
-  if (!stripe) return res.status(500).send('Stripe non configuré.');
+  if (!stripe) return res.status(500).send('Stripe non configure.');
   const sig = req.headers['stripe-signature'];
   let event;
   try {
@@ -193,24 +213,37 @@ async function webhookHandler(req, res) {
     `, [email, customerId, fields.subscriptionId || null, fields.status || 'active', fields.currentPeriodEnd || null]);
   };
 
-  // Envoie l'e-mail de bienvenue (compte + code d'invitation + lien de
-  // résiliation) une seule fois par abonné, grâce à welcome_sent_at.
+  // Envoie l'e-mail de bienvenue une seule fois par abonne.
+  // Le code d'invitation est desormais REUTILISE s'il en existe deja un de
+  // valide : sinon, chaque echec d'envoi (Resend mal configure) creait un
+  // nouveau code, et ces codes fantomes consommaient le quota d'invitations
+  // du payeur jusqu'a le bloquer completement.
   const sendWelcomeOnce = async (email, customerId) => {
     if (!email) return;
     email = email.toLowerCase();
     const row = await db.get('SELECT welcome_sent_at FROM paid_emails WHERE email = ?', [email]);
     if (row && row.welcome_sent_at) return;
 
-    const code = generateCode();
-    const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
-    await db.run(
-      'INSERT INTO invite_codes (code, source_email, role_label, expires_at) VALUES (?, ?, ?, ?)',
-      [code, email, '', expiresAt]
-    );
+    let invite = await db.get(`
+      SELECT code, expires_at FROM invite_codes
+      WHERE lower(source_email) = ? AND used_at IS NULL AND expires_at > now()
+      ORDER BY created_at DESC LIMIT 1
+    `, [email]);
+
+    if (!invite) {
+      const code = generateCode();
+      const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+      await db.run(
+        'INSERT INTO invite_codes (code, source_email, role_label, expires_at) VALUES (?, ?, ?, ?)',
+        [code, email, '', expiresAt]
+      );
+      invite = { code, expires_at: expiresAt };
+    }
+
     const result = await sendSubscriptionWelcomeEmail({
       to: email,
-      inviteCode: code,
-      inviteExpiresAt: expiresAt,
+      inviteCode: invite.code,
+      inviteExpiresAt: invite.expires_at,
       manageToken: signManageToken(customerId),
     });
     if (result.sent) {
@@ -223,7 +256,7 @@ async function webhookHandler(req, res) {
       const customer = await stripe.customers.retrieve(customerId);
       return customer && !customer.deleted ? customer.email : null;
     } catch (e) {
-      console.error('Impossible de récupérer l\'email du client Stripe:', e.message);
+      console.error('Impossible de recuperer l\'email du client Stripe:', e.message);
       return null;
     }
   }
@@ -242,17 +275,12 @@ async function webhookHandler(req, res) {
       case 'customer.subscription.created': {
         const s = event.data.object;
         const email = await getCustomerEmail(s.customer);
-        // Un client qui resilie garde l'acces jusqu'a la fin de la periode
-        // deja payee : on conserve donc le statut renvoye par Stripe (souvent
-        // encore 'active' avec cancel_at_period_end). C'est l'evenement
-        // customer.subscription.deleted, envoye par Stripe a l'echeance, qui
-        // coupera l'acces le moment venu.
         const resilie = s.cancel_at_period_end === true || !!s.canceled_at;
         const fields = {
           status: s.status,
           subscriptionId: s.id,
           priceId: s.items?.data?.[0]?.price?.id,
-          currentPeriodEnd: s.current_period_end ? new Date(s.current_period_end * 1000).toISOString() : null,
+          currentPeriodEnd: periodEndOf(s),
         };
         await upsertPaidEmail(email, s.customer, fields);
         await upsertExistingAccount(s.customer, fields);
@@ -262,7 +290,7 @@ async function webhookHandler(req, res) {
       case 'customer.subscription.deleted': {
         const s = event.data.object;
         const email = await getCustomerEmail(s.customer);
-        const periodEnd = s.current_period_end ? new Date(s.current_period_end * 1000).toISOString() : null;
+        const periodEnd = periodEndOf(s);
         await upsertPaidEmail(email, s.customer, { status: 'canceled', currentPeriodEnd: periodEnd });
         await upsertExistingAccount(s.customer, { status: 'canceled' });
         if (email) await sendCancellationEmail({ to: email, periodEnd });
@@ -272,17 +300,85 @@ async function webhookHandler(req, res) {
         break;
     }
   } catch (e) {
+    // On renvoie 500 pour que Stripe REESSAIE pendant 3 jours. Avant, une
+    // coupure d'une seconde de la base suffisait pour qu'un paiement reel ne
+    // soit jamais enregistre, sans aucun moyen de le rattraper.
     console.error('Erreur de traitement du webhook:', e);
+    return res.status(500).json({ error: 'retry' });
   }
 
   res.json({ received: true });
 }
 
-// Utilisée par /auth/register pour vérifier qu'un paiement réel existe.
-async function isEmailPaid(email) {
-  if (!email) return false;
-  const row = await db.get('SELECT status FROM paid_emails WHERE email = ?', [email.toLowerCase()]);
-  return !!row && (row.status === 'active' || row.status === 'trialing');
+// ---------------------------------------------------------------------------
+// Verification directe aupres de Stripe, en secours du webhook.
+//
+// POURQUOI : jusqu'ici, tout reposait sur le webhook. S'il n'etait pas cree,
+// mal configure, ou si Stripe n'arrivait pas a joindre le serveur endormi, la
+// table paid_emails restait vide : les paiements tombaient bien, et AUCUN
+// client ne pouvait creer son compte. Rien ne le signalait.
+//
+// Desormais, si un e-mail est inconnu, le serveur demande directement a Stripe
+// si un abonnement existe pour cette adresse. Le webhook devient une optimisation
+// et non plus un point de rupture.
+//
+// Le resultat est memorise avec sa date de controle : on ne réinterroge Stripe
+// qu'au plus une fois toutes les 12 heures par client, ce qui permet aussi de
+// detecter une resiliation meme sans webhook.
+// ---------------------------------------------------------------------------
+const DELAI_REVERIFICATION_MS = 12 * 3600 * 1000;
+
+async function syncDepuisStripe(email) {
+  if (!stripe || !email) return null;
+  email = email.toLowerCase();
+  try {
+    const clients = await stripe.customers.list({ email, limit: 5 });
+    let trouve = null;
+    for (const client of clients.data) {
+      const abos = await stripe.subscriptions.list({ customer: client.id, status: 'all', limit: 10 });
+      const actif = abos.data.find(a => ACTIVE_STATUSES.includes(a.status));
+      const abo = actif || abos.data[0];
+      if (abo) { trouve = { client, abo, statut: actif ? actif.status : 'canceled' }; if (actif) break; }
+    }
+    if (!trouve) return null;
+
+    const fin = periodEndOf(trouve.abo);
+    await db.run(`
+      INSERT INTO paid_emails (email, stripe_customer_id, stripe_subscription_id, status, current_period_end, verified_at)
+      VALUES (?, ?, ?, ?, ?, now())
+      ON CONFLICT(email) DO UPDATE SET
+        stripe_customer_id = EXCLUDED.stripe_customer_id,
+        stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, paid_emails.stripe_subscription_id),
+        status = EXCLUDED.status,
+        current_period_end = COALESCE(EXCLUDED.current_period_end, paid_emails.current_period_end),
+        verified_at = now(),
+        updated_at = now()
+    `, [email, trouve.client.id, trouve.abo.id, trouve.statut, fin]);
+    console.log(`[stripe] Abonnement retrouve directement pour ${email} : ${trouve.statut}`);
+    return trouve.statut;
+  } catch (e) {
+    console.error('[stripe] Verification directe impossible :', e.message);
+    return null;
+  }
 }
 
-module.exports = { router, webhookHandler, isEmailPaid };
+// Utilisee par /auth/register, /link/invite et /billing/status.
+async function isEmailPaid(email) {
+  if (!email) return false;
+  email = email.toLowerCase();
+  const row = await db.get('SELECT status, verified_at FROM paid_emails WHERE email = ?', [email]);
+
+  if (!row) {
+    const statut = await syncDepuisStripe(email);
+    return !!statut && ACTIVE_STATUSES.includes(statut);
+  }
+
+  const perime = !row.verified_at || (Date.now() - new Date(row.verified_at).getTime()) > DELAI_REVERIFICATION_MS;
+  if (stripe && perime) {
+    const statut = await syncDepuisStripe(email);
+    if (statut) return ACTIVE_STATUSES.includes(statut);
+  }
+  return ACTIVE_STATUSES.includes(row.status);
+}
+
+module.exports = { router, webhookHandler, isEmailPaid, syncDepuisStripe, ACTIVE_STATUSES };
