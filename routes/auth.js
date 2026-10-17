@@ -10,7 +10,22 @@ const { sendPasswordResetEmail } = require('../email');
 
 const router = express.Router();
 
-// POST /auth/register  { email, password, displayName, role, inviteCode }
+// POST /auth/register  { email, password, displayName, role, inviteCode, amazon }
+//
+// Preuve de paiement acceptee, dans cet ordre :
+//   1. l'e-mail a un abonnement Stripe actif (achat sur le site) ;
+//   2. `amazon` : { userId, receiptIds } -- achat integre de l'Appstore Amazon,
+//      verifie aupres d'Amazon (application Fire) ;
+//   3. un code d'invitation valide.
+//
+// EXCEPTION -- application Fire (User-Agent "SpectraAmazon/...") : la creation
+// du compte est LIBRE, sans paiement ni code. Le compte est cree sans
+// abonnement ; l'application affiche alors l'ecran d'abonnement Amazon, et
+// l'acces s'ouvre quand l'achat integre est verifie (/amazon/verify). Avant,
+// "Creer un compte" renvoyait une erreur tant qu'on n'avait pas deja paye,
+// ce qui empechait un testeur d'Amazon (ou un nouveau client) d'aller plus loin.
+// Le mur d'acces reste intact : sans abonnement, /billing/status repond
+// "inactive". Sur le site web, rien ne change : paiement ou invitation d'abord.
 router.post('/register', async (req, res) => {
   try {
     const { email, password, displayName, role, inviteCode } = req.body || {};
@@ -28,8 +43,33 @@ router.post('/register', async (req, res) => {
     if (existing) return res.status(409).json({ error: 'Un compte existe deja avec cet email.' });
 
     const { isEmailPaid } = require('./billing');
+    const amazon = require('../amazon');
     let authorized = await isEmailPaid(normalizedEmail);
     let usedInvite = null;
+    let amazonAccepte = null; // preuve d'achat Amazon verifiee
+
+    // Achat integre de l'Appstore Amazon : le serveur demande a Amazon si le
+    // recu est reel et en cours. Aucune confiance n'est accordee a l'application.
+    const preuveAmazon = (req.body || {}).amazon;
+    if (!authorized && preuveAmazon) {
+      const entree = amazon.lireEntree(preuveAmazon);
+      if (entree.erreur) {
+        return res.status(400).json({ error: entree.erreur, code: 'AMAZON_INVALID_REQUEST' });
+      }
+      const verification = await amazon.verifierRecus(entree.userId, entree.receiptIds);
+      if (verification.etat === 'temporaire' || verification.etat === 'config') {
+        res.set('Retry-After', '30');
+        return res.status(503).json({
+          error: 'La verification de votre achat aupres d\'Amazon est momentanement indisponible. Rien n\'est perdu : reessayez dans un instant.',
+          code: 'AMAZON_UNAVAILABLE',
+          retry: true,
+        });
+      }
+      if (verification.etat === 'valide') {
+        amazonAccepte = { userId: entree.userId, verification };
+        authorized = true;
+      }
+    }
 
     if (!authorized && inviteCode) {
       const invite = await db.get('SELECT * FROM invite_codes WHERE code = ?', [inviteCode.toUpperCase()]);
@@ -44,19 +84,60 @@ router.post('/register', async (req, res) => {
       }
     }
 
+    // Compte libre : application Fire, sans preuve d'achat ni code d'invitation.
+    let compteLibre = false;
     if (!authorized) {
-      return res.status(402).json({
-        error: 'Aucun paiement confirme pour cet email, et aucun code d\'invitation valide fourni. Abonnez-vous d\'abord, ou demandez un code d\'invitation a la personne qui a deja un compte.',
-        code: 'PAYMENT_REQUIRED',
-      });
+      const dansAppAmazon = amazon.estAppAmazon(req);
+      if (dansAppAmazon && !preuveAmazon && !String(inviteCode || '').trim()) {
+        compteLibre = true;
+      } else if (dansAppAmazon && !preuveAmazon) {
+        // Un code a ete saisi mais il n'est pas valable (inconnu, deja utilise,
+        // expire, ou son parrain n'est plus abonne) : on le dit, plutot que de
+        // creer en silence un compte sans acces. Aucun autre moyen de paiement
+        // n'est mentionne (regle de l'Appstore).
+        return res.status(402).json({
+          error: 'Ce code d\'invitation n\'est pas valable (inconnu, deja utilise, expire, ou la personne qui l\'a cree n\'est plus abonnee). Verifiez-le, ou laissez ce champ vide : vous creerez votre compte puis vous vous abonnerez.',
+          code: 'INVITE_INVALID',
+        });
+      } else {
+        // Dans l'application Amazon, on ne renvoie vers aucun autre moyen de
+        // paiement (regle de l'Appstore) : le message parle uniquement de l'achat integre.
+        const message = dansAppAmazon
+          ? 'Aucun abonnement actif n\'a ete trouve. Abonnez-vous depuis l\'ecran d\'abonnement de l\'application, ou saisissez le code d\'invitation de la personne qui a deja un compte.'
+          : 'Aucun paiement confirme pour cet email, et aucun code d\'invitation valide fourni. Abonnez-vous d\'abord, ou demandez un code d\'invitation a la personne qui a deja un compte.';
+        return res.status(402).json({ error: message, code: 'PAYMENT_REQUIRED' });
+      }
     }
 
     const id = randomUUID();
     const passwordHash = await bcrypt.hash(password, 10);
-    await db.run(
-      'INSERT INTO users (id, email, password_hash, display_name, role, invited_via) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, normalizedEmail, passwordHash, displayName || '', role, usedInvite ? usedInvite.code : null]
-    );
+    const insertUser = 'INSERT INTO users (id, email, password_hash, display_name, role, invited_via) VALUES (?, ?, ?, ?, ?, ?)';
+    const valeursUser = [id, normalizedEmail, passwordHash, displayName || '', role, usedInvite ? usedInvite.code : null];
+    if (amazonAccepte) {
+      // Compte et abonnement Amazon crees ENSEMBLE : si le rattachement echoue,
+      // le compte n'est pas cree non plus, et l'achat reste utilisable.
+      try {
+        await db.transaction(async (t) => {
+          await t.run(insertUser, valeursUser);
+          await amazon.enregistrer(t, { email: normalizedEmail, userId: amazonAccepte.userId, verification: amazonAccepte.verification });
+        });
+      } catch (e) {
+        if (e.code === 'AMAZON_ALREADY_LINKED' || (e.code === '23505' && /amazon/.test(e.constraint || ''))) {
+          return res.status(409).json({
+            error: 'Cet abonnement Amazon est deja rattache a un autre compte Spectra'
+              + (e.emailMasque ? ' (' + e.emailMasque + ')' : '')
+              + '. Connectez-vous avec ce compte.',
+            code: 'AMAZON_ALREADY_LINKED',
+          });
+        }
+        if (e.code === 'AMAZON_OTHER_ACCOUNT') {
+          return res.status(409).json({ error: e.message, code: 'AMAZON_OTHER_ACCOUNT' });
+        }
+        throw e;
+      }
+    } else {
+      await db.run(insertUser, valeursUser);
+    }
 
     if (usedInvite) {
       if (usedInvite.inviter_id && usedInvite.inviter_role && usedInvite.inviter_role !== role) {
@@ -71,7 +152,11 @@ router.post('/register', async (req, res) => {
     }
 
     const user = { id, email: normalizedEmail, role };
-    res.status(201).json({ token: signToken(user), user: { id, email: user.email, role, displayName: displayName || '' } });
+    res.status(201).json({
+      token: signToken(user),
+      user: { id, email: user.email, role, displayName: displayName || '' },
+      subscriptionRequired: compteLibre,
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erreur serveur lors de la creation du compte.' });

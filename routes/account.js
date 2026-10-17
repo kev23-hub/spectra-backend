@@ -21,6 +21,7 @@ const bcrypt = require('bcryptjs');
 const Stripe = require('stripe');
 const db = require('../db');
 const { requireAuth } = require('../auth');
+const amazon = require('../amazon');
 
 const router = express.Router();
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
@@ -68,6 +69,15 @@ router.delete('/', async (req, res) => {
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: 'Mot de passe incorrect.' });
 
+  // 0) Un abonnement vendu par l'Appstore Amazon ne peut être résilié que par le
+  //    client lui-même, auprès d'Amazon : le serveur n'a aucun moyen de le faire.
+  //    On le dit clairement à l'utilisateur, sinon il continuerait à être prélevé.
+  const lignePaiement = await db.get(
+    'SELECT amazon_status, amazon_period_end, amazon_env FROM paid_emails WHERE email = ?',
+    [user.email.toLowerCase()]
+  );
+  const amazonEnCours = amazon.actif(lignePaiement);
+
   // 1) Résiliation Stripe. On ne bloque pas la suppression si Stripe échoue :
   //    le compte doit disparaître même en cas d'incident côté paiement.
   if (stripe) {
@@ -97,7 +107,10 @@ router.delete('/', async (req, res) => {
 
   res.json({
     deleted: true,
-    message: "Votre compte et vos données ont été supprimés. L'abonnement associé, s'il existait, a été résilié.",
+    amazonSubscriptionActive: amazonEnCours,
+    message: amazonEnCours
+      ? "Votre compte et vos données ont été supprimés. Attention : votre abonnement acheté via Amazon n'est pas résilié automatiquement. Pour arrêter les prélèvements, résiliez-le dans les abonnements de votre compte Amazon."
+      : "Votre compte et vos données ont été supprimés. L'abonnement associé, s'il existait, a été résilié.",
   });
 });
 

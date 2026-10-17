@@ -4,6 +4,7 @@
 
 const express = require('express');
 const backup = require('../backup');
+const amazon = require('../amazon');
 
 const router = express.Router();
 
@@ -28,7 +29,9 @@ router.get('/etat', async (req, res) => {
   res.json({
     comptes: await compte('users'),
     liens: await compte('links'),
-    abonnesPayants: (await db.get("SELECT count(*)::int AS n FROM paid_emails WHERE status IN ('active','trialing')")).n,
+    abonnesPayants: (await db.get("SELECT count(*)::int AS n FROM paid_emails WHERE status IN ('active','trialing') OR (amazon_status = 'active' AND amazon_period_end > now())")).n,
+    abonnesAmazon: (await db.get("SELECT count(*)::int AS n FROM paid_emails WHERE amazon_status = 'active' AND amazon_period_end > now()")).n,
+    amazon: { pret: amazon.pret(), mode: amazon.config().mode },
     donneesSynchronisees: await compte('kv_store'),
     notifications: await compte('push_subscriptions'),
     sauvegardeAuto: !!(process.env.GITHUB_TOKEN && process.env.GITHUB_BACKUP_REPO && process.env.BACKUP_PASSPHRASE),

@@ -4,6 +4,7 @@ const { randomUUID, randomBytes } = require('crypto');
 const db = require('../db');
 const { requireAuth, signManageToken, verifyManageToken } = require('../auth');
 const { sendSubscriptionWelcomeEmail, sendCancellationEmail } = require('../email');
+const amazon = require('../amazon');
 
 const router = express.Router();
 
@@ -19,8 +20,29 @@ const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SEC
 // inviter personne ni creer de compte, sans explication.
 const ACTIVE_STATUSES = ['active', 'trialing', 'past_due'];
 
+// Une ligne de paid_emails ouvre l'acces si Stripe OU Amazon est actif.
+// Utilisee partout a la place de ACTIVE_STATUSES.includes(ligne.status), pour
+// qu'un abonne Amazon soit reconnu aussi comme parrain d'invitations, etc.
+function ligneActive(ligne) {
+  return !!ligne && (ACTIVE_STATUSES.includes(ligne.status) || amazon.actif(ligne));
+}
+
 function requireStripe(req, res, next) {
   if (!stripe) return res.status(500).json({ error: 'Stripe n\'est pas configure sur ce serveur (STRIPE_SECRET_KEY manquante).' });
+  next();
+}
+
+// Regle de l'Appstore Amazon : dans l'application Fire, l'abonnement se vend
+// UNIQUEMENT par l'achat integre d'Amazon, jamais par un autre moyen de
+// paiement. L'application envoie "SpectraAmazon/x.y.z" dans son User-Agent :
+// meme si une page tentait d'ouvrir Stripe, le serveur ne fournirait aucun lien.
+function refuserDansAppAmazon(req, res, next) {
+  if (amazon.estAppAmazon(req)) {
+    return res.status(403).json({
+      error: 'Dans l\'application Amazon, l\'abonnement se gere depuis l\'Appstore Amazon.',
+      code: 'USE_AMAZON_IAP',
+    });
+  }
   next();
 }
 
@@ -39,7 +61,7 @@ function periodEndOf(subscription) {
 }
 
 // POST /billing/create-checkout-session (auth requise)
-router.post('/create-checkout-session', requireAuth, requireStripe, async (req, res) => {
+router.post('/create-checkout-session', refuserDansAppAmazon, requireAuth, requireStripe, async (req, res) => {
   try {
     const user = await db.get('SELECT * FROM users WHERE id = ?', [req.user.sub]);
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable.' });
@@ -75,7 +97,7 @@ router.post('/create-checkout-session', requireAuth, requireStripe, async (req, 
 });
 
 // POST /billing/create-portal-session (auth requise, depuis l'app)
-router.post('/create-portal-session', requireAuth, requireStripe, async (req, res) => {
+router.post('/create-portal-session', refuserDansAppAmazon, requireAuth, requireStripe, async (req, res) => {
   const sub = await db.get('SELECT * FROM subscriptions WHERE user_id = ?', [req.user.sub]);
   let customerId = sub && sub.stripe_customer_id;
   if (!customerId) {
@@ -122,6 +144,8 @@ router.get('/status', requireAuth, async (req, res) => {
   const sub = await db.get('SELECT status, price_id, current_period_end FROM subscriptions WHERE user_id = ?', [req.user.sub]);
   let status = sub ? sub.status : null;
   let periodEnd = sub ? sub.current_period_end : null;
+  // D'ou vient l'acces : 'stripe', 'amazon' ou 'linked' (compte invite).
+  let source = status && ACTIVE_STATUSES.includes(status) ? 'stripe' : null;
 
   const inactive = () => !status || status === 'inactive' || !ACTIVE_STATUSES.includes(status);
 
@@ -129,8 +153,16 @@ router.get('/status', requireAuth, async (req, res) => {
     // isEmailPaid interroge Stripe directement si l'e-mail est inconnu ou si le
     // dernier controle date de plus de 12 h : l'acces ne depend donc plus du webhook.
     await isEmailPaid(req.user.email);
-    const paid = await db.get('SELECT status, current_period_end FROM paid_emails WHERE email = ?', [req.user.email.toLowerCase()]);
-    if (paid && ACTIVE_STATUSES.includes(paid.status)) { status = paid.status; periodEnd = paid.current_period_end; }
+    const paid = await db.get(
+      'SELECT status, current_period_end, amazon_status, amazon_period_end, amazon_env FROM paid_emails WHERE email = ?',
+      [req.user.email.toLowerCase()]
+    );
+    if (paid && ACTIVE_STATUSES.includes(paid.status)) {
+      status = paid.status; periodEnd = paid.current_period_end; source = 'stripe';
+    } else if (paid && amazon.actif(paid)) {
+      // Abonnement vendu par l'Appstore Amazon (application Fire).
+      status = 'active'; periodEnd = paid.amazon_period_end; source = 'amazon';
+    }
   }
 
   // Compte cree via code d'invitation : l'acces depend du payeur qui l'a invite.
@@ -145,8 +177,15 @@ router.get('/status', requireAuth, async (req, res) => {
           sponsorEmail = inviter && inviter.email;
         }
         if (sponsorEmail) {
-          const sponsor = await db.get('SELECT status FROM paid_emails WHERE email = ?', [sponsorEmail.toLowerCase()]);
-          if (sponsor && ACTIVE_STATUSES.includes(sponsor.status)) status = 'linked';
+          // Le payeur Amazon n'ouvre peut-etre pas l'application lui-meme : on
+          // revérifie son abonnement ici, sinon l'acces des comptes invites
+          // s'arreterait a la fin de sa periode meme s'il a ete renouvele.
+          await amazon.rafraichir(sponsorEmail.toLowerCase());
+          const sponsor = await db.get(
+            'SELECT status, amazon_status, amazon_period_end, amazon_env FROM paid_emails WHERE email = ?',
+            [sponsorEmail.toLowerCase()]
+          );
+          if (ligneActive(sponsor)) { status = 'linked'; source = 'linked'; }
         }
       }
     }
@@ -163,13 +202,17 @@ router.get('/status', requireAuth, async (req, res) => {
       WHERE l.person_id = ? OR l.caregiver_id = ?
     `, [req.user.sub, req.user.sub, req.user.sub]);
     for (const other of others) {
-      const sponsor = await db.get('SELECT status FROM paid_emails WHERE email = ?', [other.email.toLowerCase()]);
-      if (sponsor && ACTIVE_STATUSES.includes(sponsor.status)) { status = 'linked'; break; }
+      await amazon.rafraichir(other.email.toLowerCase());
+      const sponsor = await db.get(
+        'SELECT status, amazon_status, amazon_period_end, amazon_env FROM paid_emails WHERE email = ?',
+        [other.email.toLowerCase()]
+      );
+      if (ligneActive(sponsor)) { status = 'linked'; source = 'linked'; break; }
     }
   }
 
   const active = ACTIVE_STATUSES.includes(status) || status === 'linked';
-  res.json({ status: status || 'inactive', active, currentPeriodEnd: periodEnd });
+  res.json({ status: status || 'inactive', active, currentPeriodEnd: periodEnd, source: active ? source : null });
 });
 
 // POST /billing/webhook -- appele par Stripe uniquement.
@@ -366,12 +409,27 @@ async function syncDepuisStripe(email) {
 async function isEmailPaid(email) {
   if (!email) return false;
   email = email.toLowerCase();
-  const row = await db.get('SELECT status, verified_at FROM paid_emails WHERE email = ?', [email]);
+  let row = await db.get(
+    'SELECT status, verified_at, amazon_user_id, amazon_receipt_id, amazon_status, amazon_period_end, amazon_verified_at, amazon_env FROM paid_emails WHERE email = ?',
+    [email]
+  );
 
   if (!row) {
     const statut = await syncDepuisStripe(email);
     return !!statut && ACTIVE_STATUSES.includes(statut);
   }
+
+  // Abonnement Amazon deja enregistre : si le dernier controle date de plus de
+  // 12 h, on redemande l'etat a Amazon (renouvellement mensuel, resiliation).
+  // Amazon ne renvoie plus le recu d'un abonnement qui continue : sans cette
+  // revérification, l'acces se couperait un mois apres l'achat.
+  if (amazon.aRafraichir(row)) row = (await amazon.rafraichir(email)) || row;
+
+  // Abonnement Amazon en cours : acces ouvert, sans meme interroger Stripe.
+  // Stripe et Amazon sont deux sources independantes (colonnes separees) ; un
+  // ancien abonnement Stripe resilie ne doit jamais fermer l'acces d'un abonne
+  // Amazon.
+  if (amazon.actif(row)) return true;
 
   const perime = !row.verified_at || (Date.now() - new Date(row.verified_at).getTime()) > DELAI_REVERIFICATION_MS;
   if (stripe && perime) {
@@ -381,4 +439,4 @@ async function isEmailPaid(email) {
   return ACTIVE_STATUSES.includes(row.status);
 }
 
-module.exports = { router, webhookHandler, isEmailPaid, syncDepuisStripe, ACTIVE_STATUSES };
+module.exports = { router, webhookHandler, isEmailPaid, syncDepuisStripe, ACTIVE_STATUSES, ligneActive };
