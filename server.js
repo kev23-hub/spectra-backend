@@ -21,8 +21,16 @@ app.set('trust proxy', 1);
 // retiree : n'importe qui peut deployer un site sur vercel.app en deux
 // minutes, elle annulait donc l'interet de la liste blanche. Ajoutez vos
 // domaines de preview dans ALLOWED_ORIGINS si vous en avez besoin.
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://spectreautisme2026.vercel.app')
-  .split(',').map(s => s.trim()).filter(Boolean);
+//
+// Les deux domaines de Spectra sont TOUJOURS autorises, en plus de la variable
+// ALLOWED_ORIGINS : l'application Fire charge le site depuis
+// spectra-nouveau.vercel.app, et si ce domaine manquait dans la variable,
+// toutes ses requetes seraient refusees (erreur 403).
+const originesSpectra = ['https://spectreautisme2026.vercel.app', 'https://spectra-nouveau.vercel.app'];
+const allowedOrigins = [...new Set([
+  ...originesSpectra,
+  ...(process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
+])];
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // curl, applications mobiles, webhooks
@@ -68,6 +76,7 @@ app.use('/link', require('./routes/link'));
 app.use('/sync', require('./routes/sync'));
 app.use('/push', require('./routes/push').router);
 app.use('/billing', billingRouter);
+app.use('/amazon', require('./routes/amazon'));
 
 app.use((req, res) => res.status(404).json({ error: 'Route inconnue.' }));
 app.use((err, req, res, next) => {
@@ -107,10 +116,16 @@ function planifierReveil() {
   console.log(`[reveil] Maintien en eveil de ${debut} h a ${fin} h (heure du serveur).`);
 }
 
+const relecteurs = require('./reviewers');
+
 db.init()
+  // Comptes de test des relecteurs Amazon (variables REVIEWER_PASSWORD_1 et _2) :
+  // crees AVANT l'ouverture du service, pour exister des la premiere requete.
+  .then(() => relecteurs.assurerComptes())
   .then(() => app.listen(PORT, () => {
     console.log('Spectra backend en ecoute sur le port ' + PORT);
     planifierReveil();
+    relecteurs.planifier();
     require('./backup').planifierSauvegardes();
   }))
   .catch((e) => {

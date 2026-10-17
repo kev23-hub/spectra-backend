@@ -112,3 +112,25 @@ CREATE INDEX IF NOT EXISTS idx_invite_inviter ON invite_codes(inviter_id);
 -- Permet de se passer du webhook : si la colonne est vide ou trop ancienne,
 -- le serveur redemande a Stripe l'etat reel de l'abonnement.
 ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+
+-- Abonnements vendus par l'Appstore Amazon (application Fire).
+-- Colonnes SEPAREES de celles de Stripe : un e-mail peut avoir l'un, l'autre ou
+-- les deux, et aucun des deux circuits ne peut ecraser l'autre. L'acces est
+-- ouvert si l'un des deux est actif (voir amazon.js).
+--   amazon_user_id      identifiant du compte Amazon de l'acheteur
+--   amazon_receipt_id   dernier recu verifie
+--   amazon_status       'active' ou 'canceled'
+--   amazon_period_end   fin de la periode payee
+--   amazon_verified_at  derniere verification aupres d'Amazon
+--   amazon_env          'production' ou 'sandbox' (achats de test)
+ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS amazon_user_id TEXT;
+ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS amazon_receipt_id TEXT;
+ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS amazon_status TEXT;
+ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS amazon_period_end TIMESTAMPTZ;
+ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS amazon_verified_at TIMESTAMPTZ;
+ALTER TABLE paid_emails ADD COLUMN IF NOT EXISTS amazon_env TEXT;
+
+-- Un compte Amazon ne peut etre rattache qu'a un seul e-mail Spectra : sinon
+-- un abonnement unique pourrait ouvrir un nombre illimite de comptes.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_paid_emails_amazon_user
+  ON paid_emails(amazon_user_id) WHERE amazon_user_id IS NOT NULL;
